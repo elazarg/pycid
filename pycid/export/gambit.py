@@ -212,15 +212,20 @@ def behavior_to_cpd(
         pv_tuple: InfosetKey = (macid.decision_agent[node], tuple(pv.items()))
         # get the infoset for the node
         infoset = parents_to_infoset[pv_tuple]
+        domain = macid.model.domain[node]
         # if the infoset does not exist, this is not a valid parent instantiation
+        # Return uniform distribution for unreachable branches
         if not infoset:
-            return {}
+            return {outcome: 1.0 / len(domain) for outcome in domain}
         # get the action probs for the infoset
         # In pygambit 16.5.0, iterating behavior[infoset] yields (Action, probability) tuples
         action_probs = {
-            macid.model.domain[node][i]: float(action_prob[1])
+            domain[i]: float(action_prob[1])
             for i, action_prob in enumerate(behavior[infoset])
         }
+        # Handle unreachable branches where NE solver returns 0 for all actions
+        if sum(action_probs.values()) < 1e-9:
+            return {outcome: 1.0 / len(domain) for outcome in domain}
         return action_probs
 
     def _wrapped_partial(
