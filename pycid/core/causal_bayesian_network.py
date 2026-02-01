@@ -8,7 +8,7 @@ import networkx as nx
 import numpy as np
 from pgmpy.factors.discrete import TabularCPD
 from pgmpy.inference.ExactInference import BeliefPropagation
-from pgmpy.models import BayesianNetwork
+from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.sampling import BayesianModelSampling
 
 from pycid.core.cpd import ConstantCPD, Outcome, ParentsNotReadyException, StochasticFunctionCPD
@@ -16,7 +16,7 @@ from pycid.core.cpd import ConstantCPD, Outcome, ParentsNotReadyException, Stoch
 Relationship = Union[TabularCPD, Dict[Outcome, float], Callable[..., Union[Outcome, Dict[Outcome, float]]]]
 
 
-class CausalBayesianNetwork(BayesianNetwork):
+class CausalBayesianNetwork(DiscreteBayesianNetwork):
     """Causal Bayesian Network
 
     A Causal Bayesian Network is a Bayesian Network where the directed edges represent every causal relationship
@@ -48,7 +48,7 @@ class CausalBayesianNetwork(BayesianNetwork):
                 return
 
             # add cpd to BayesianNetwork, and update domain dictionary
-            BayesianNetwork.add_cpds(self.cbn, cpd)
+            DiscreteBayesianNetwork.add_cpds(self.cbn, cpd)
             old_domain = self.domain.get(variable, None)
             self.domain[variable] = cpd.state_names[variable]
 
@@ -63,7 +63,7 @@ class CausalBayesianNetwork(BayesianNetwork):
         def __delitem__(self, variable: str) -> None:
             super().__delitem__(variable)
             try:
-                BayesianNetwork.remove_cpds(self.cbn, variable)
+                DiscreteBayesianNetwork.remove_cpds(self.cbn, variable)
             except ValueError:
                 pass
 

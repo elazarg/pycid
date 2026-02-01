@@ -3,22 +3,26 @@ from __future__ import annotations
 import itertools
 from collections import defaultdict
 from functools import partial, update_wrapper
-from typing import Any, Callable, Dict, Hashable, Iterable, KeysView, List, Mapping, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Hashable, Iterable, KeysView, List, Mapping, Optional, Set, Tuple, Union
 from warnings import warn
 
 import pygambit
 
-from pycid.core.cpd import StochasticFunctionCPD
+from pycid.core.cpd import Outcome, StochasticFunctionCPD
 from pycid.core.macid_base import MACIDBase
 
-Outcome = Any
+# Type alias for infoset key: (agent, ((parent, value), ...))
+InfosetKey = Tuple[Hashable, Tuple[Tuple[str, Outcome], ...]]
+
+# Union of behavior and strategy profiles returned by solvers
+ProfileType = Union[pygambit.MixedBehaviorProfile, pygambit.MixedStrategyProfile]
 
 
 def macid_to_efg(
     macid: MACIDBase,
     decisions_in_sg: Optional[Union[KeysView[str], Set[str]]] = None,
     agents_in_sg: Optional[Iterable[Hashable]] = None,
-) -> Tuple[pygambit.Game, Mapping[Tuple[Hashable, Tuple[Tuple[Any, Any], ...]], pygambit.Infoset]]:
+) -> Tuple[pygambit.Game, Mapping[InfosetKey, pygambit.Infoset]]:
     """
     Creates a pygambit EFG from a MACID:
     1) Finds the MACID nodes needed for the EFG (decision nodes and informational parents S = {D u Pa_D})
@@ -53,10 +57,10 @@ def macid_to_efg(
     agent_to_player = _add_players(game, agents_in_sg)
 
     # key is instantiation of parents, value is pygambit infoset
-    parents_to_infoset: Dict[Tuple[Hashable, Tuple[Tuple[Any, Any], ...]], pygambit.Infoset] = defaultdict(dict)
+    parents_to_infoset: Dict[InfosetKey, pygambit.Infoset] = defaultdict(dict)
     # nodes referenced in the game tree. Root has node_idx (0,), rest are (0, n, m, ...)
     # state is a dict of node_idx:state of partial instantiations of nodes
-    node_idx_to_state: Dict[Tuple[int, ...], Dict[str, Any]] = defaultdict(dict)
+    node_idx_to_state: Dict[Tuple[int, ...], Dict[str, Outcome]] = defaultdict(dict)
     # get cardinality of each node
     num_children = [1] + [len(macid.model.domain[node]) for node in sorted_game_tree_nodes]
     range_num_children = [list(range(x)) for x in num_children]
@@ -76,35 +80,40 @@ def macid_to_efg(
                 agent = macid.decision_agent[node]
                 player = agent_to_player[agent]
                 actions = macid.model.domain[node]
-                parents_actions_tuple = (agent, tuple(parents_actions.items()))  # hashable
+                action_labels = [str(a) for a in actions]
+                parents_actions_tuple: InfosetKey = (agent, tuple(parents_actions.items()))
                 # check if this matches an existing infoset
                 if parents_actions_tuple in parents_to_infoset:
                     cur_infoset = parents_to_infoset[parents_actions_tuple]
-                    cur_node.append_move(cur_infoset)
+                    game.append_infoset(cur_node, cur_infoset)
                 # else create a new infoset
                 else:
-                    cur_infoset = cur_node.append_move(player, len(actions))
+                    game.append_move(cur_node, player, action_labels)
+                    cur_infoset = cur_node.infoset
                     # label with the node for easy reference
                     cur_infoset.label = node
                     # add to infosets
                     parents_to_infoset[parents_actions_tuple] = cur_infoset
                 # add state info
                 for action_idx, action in enumerate(actions):
-                    cur_infoset.actions[action_idx].label = str(action)
                     state_info = node_idx_to_state[node_idx].copy()
                     state_info.update({node: action})
                     node_idx_to_state[node_idx + (action_idx,)] = state_info
             else:
                 # otherwise is a chance node
                 factor = macid.query([node], context=parents_actions)
-                move = cur_node.append_move(game.players.chance, factor.cardinality)
-                # add state info
                 actions = macid.model.domain[node]
-                for action_idx, prob in enumerate(factor.values):
-                    move.actions[action_idx].label = str(actions[action_idx])
-                    move.actions[action_idx].prob = pygambit.Decimal(prob)
+                action_labels = [str(a) for a in actions]
+                # Create the chance move
+                game.append_move(cur_node, game.players.chance, action_labels)
+                chance_infoset = cur_node.infoset
+                # Set all chance probabilities at once
+                probs = [float(p) for p in factor.values]
+                game.set_chance_probs(chance_infoset, probs)
+                # add state info
+                for action_idx, action in enumerate(actions):
                     state_info = node_idx_to_state[node_idx].copy()
-                    state_info.update({node: actions[action_idx]})
+                    state_info.update({node: action})
                     node_idx_to_state[node_idx + (action_idx,)] = state_info
 
     game = _add_payoffs(macid, game, range_num_children, node_idx_to_state, agents_in_sg)
@@ -119,7 +128,7 @@ def macid_to_gambit_file(macid: MACIDBase, filename: str = "macid.efg") -> bool:
     - filename: The filename to save the EFG to (default: macid.efg)."""
     game, _ = macid_to_efg(macid)
     with open(filename, "w") as f:
-        f.write(game.write())
+        f.write(game.to_efg())
     print("\nGambit .efg file has been created from the macid")
 
     return True
@@ -127,7 +136,7 @@ def macid_to_gambit_file(macid: MACIDBase, filename: str = "macid.efg") -> bool:
 
 def pygambit_ne_solver(
     game: pygambit.Game, solver_override: Optional[str] = None
-) -> List[pygambit.lib.libgambit.MixedStrategyProfile]:
+) -> List[ProfileType]:
     """Uses pygambit to find the Nash equilibria of the EFG.
     Default solver is enummixed for 2 player games. This finds all NEs.
     For non-2-player games, the default is enumpure which finds all pure NEs.
@@ -138,7 +147,7 @@ def pygambit_ne_solver(
     Returns a list of behaviour strategies corresponding to NEs.
     """
     # check if a 2 player game, if so, default to enummixed, else enumpure
-    two_player = True if len(game.players) == 2 else False
+    two_player = len(game.players) == 2
     if solver_override is None:
         solver = "enummixed" if two_player else "enumpure"
     elif solver_override in ["enummixed", "lcp", "lp"] and not two_player:
@@ -148,35 +157,44 @@ def pygambit_ne_solver(
         solver = solver_override
 
     if solver == "enummixed":
-        mixed_strategies = pygambit.nash.enummixed_solve(game, rational=False)
+        result = pygambit.nash.enummixed_solve(game, rational=False)
     elif solver == "enumpure":
-        mixed_strategies = pygambit.nash.enumpure_solve(game)
+        result = pygambit.nash.enumpure_solve(game)
         # if no pure NEs found, try simpdiv if not overridden by user
-        if len(mixed_strategies) == 0 and solver_override is None:
+        if len(result.equilibria) == 0 and solver_override is None:
             warn("No pure NEs found using enumpure. Trying simpdiv.")
-            mixed_strategies = pygambit.nash.simpdiv_solve(game)
+            start_profile = game.mixed_strategy_profile(rational=True)
+            result = pygambit.nash.simpdiv_solve(start_profile)
     elif solver == "lcp":
-        mixed_strategies = pygambit.nash.lcp_solve(game, rational=False)
+        result = pygambit.nash.lcp_solve(game, rational=False)
     elif solver == "lp":
-        mixed_strategies = pygambit.nash.lp_solve(game, rational=False)
+        result = pygambit.nash.lp_solve(game, rational=False)
     elif solver == "simpdiv":
-        mixed_strategies = pygambit.nash.simpdiv_solve(game)
+        # simpdiv requires a starting profile, not a game
+        start_profile = game.mixed_strategy_profile(rational=True)
+        result = pygambit.nash.simpdiv_solve(start_profile)
     elif solver == "ipa":
-        mixed_strategies = pygambit.nash.ipa_solve(game)
+        result = pygambit.nash.ipa_solve(game)
     elif solver == "gnm":
-        mixed_strategies = pygambit.nash.gnm_solve(game)
+        result = pygambit.nash.gnm_solve(game)
     else:
         raise ValueError(f"Solver {solver} not recognised")
-    # convert to behavior strategies
-    behavior_strategies = [x.as_behavior() if solver not in ["lp", "lcp"] else x for x in mixed_strategies]
+
+    # Extract equilibria from NashComputationResult
+    mixed_strategies = result.equilibria
+
+    # convert to behavior strategies (except lp/lcp which return strategy profiles directly)
+    behavior_strategies: List[ProfileType] = [
+        x.as_behavior() if solver not in ["lp", "lcp"] else x for x in mixed_strategies
+    ]
 
     return behavior_strategies
 
 
 def behavior_to_cpd(
     macid: MACIDBase,
-    parents_to_infoset: Mapping[Tuple[Hashable, Tuple[Tuple[str, Any], ...]], pygambit.Infoset],
-    behavior: pygambit.lib.libgambit.MixedStrategyProfile,
+    parents_to_infoset: Mapping[InfosetKey, pygambit.Infoset],
+    behavior: pygambit.MixedBehaviorProfile,
     decisions_in_sg: Optional[Union[KeysView[str], Set[str]]] = None,
 ) -> List[StochasticFunctionCPD]:
     """Convert a pygambit behavior strategy to list of CPDs for each decision node.
@@ -189,20 +207,25 @@ def behavior_to_cpd(
     - cpds: A list of CPDs for each decision node.
     """
 
-    def _action_prob_given_parents(node: Any, **pv: Outcome) -> Mapping[str, float]:
+    def _action_prob_given_parents(node: str, **pv: Outcome) -> Mapping[Outcome, float]:
         """Takes the parent instantiation and outputs the prob from the infoset"""
-        pv_tuple = (macid.decision_agent[node], tuple(pv.items()))
+        pv_tuple: InfosetKey = (macid.decision_agent[node], tuple(pv.items()))
         # get the infoset for the node
         infoset = parents_to_infoset[pv_tuple]
         # if the infoset does not exist, this is not a valid parent instantiation
-        # TODO this was needed previously, but probably not needed anymore
         if not infoset:
             return {}
         # get the action probs for the infoset
-        action_probs = {macid.model.domain[node][i]: float(prob) for i, prob in enumerate(behavior[infoset])}
+        # In pygambit 16.5.0, iterating behavior[infoset] yields (Action, probability) tuples
+        action_probs = {
+            macid.model.domain[node][i]: float(action_prob[1])
+            for i, action_prob in enumerate(behavior[infoset])
+        }
         return action_probs
 
-    def _wrapped_partial(func: Callable, *args: str) -> Callable:
+    def _wrapped_partial(
+        func: Callable[..., Mapping[Outcome, float]], *args: str
+    ) -> Callable[..., Mapping[Outcome, float]]:
         """Adds __name__ and __doc__ to partial functions"""
         partial_func = partial(func, *args)
         update_wrapper(partial_func, func)
@@ -226,9 +249,9 @@ def behavior_to_cpd(
 
 def _add_players(game: pygambit.Game, agents_in_sg: Iterable[Hashable]) -> Dict[Hashable, pygambit.Player]:
     """add players to the pygambit game"""
-    agent_to_player = {}
+    agent_to_player: Dict[Hashable, pygambit.Player] = {}
     for agent in agents_in_sg:
-        player = game.players.add(agent)
+        player = game.add_player(str(agent))
         agent_to_player[agent] = player
 
     return agent_to_player
@@ -237,20 +260,20 @@ def _add_players(game: pygambit.Game, agents_in_sg: Iterable[Hashable]) -> Dict[
 def _add_payoffs(
     macid: MACIDBase,
     game: pygambit.Game,
-    range_num_children: List[List],
-    node_idx_to_state: Dict[Tuple[int, ...], Dict[str, Any]],
+    range_num_children: List[List[int]],
+    node_idx_to_state: Dict[Tuple[int, ...], Dict[str, Outcome]],
     agents_in_sg: Iterable[Hashable],
 ) -> pygambit.Game:
     """add payoffs to the game as leave nodes"""
+    agents_list = list(agents_in_sg)
     for node_idx in itertools.product(*range_num_children):
         cur_node = _get_cur_node(game, node_idx)
         context = node_idx_to_state[node_idx]
-        # name outcome as a string of the node_idx
-        payoff_tuple = game.outcomes.add(str(node_idx))
-        for i, agent in enumerate(agents_in_sg):
-            payoff = macid.expected_utility(context=context, agent=agent)
-            payoff_tuple[i] = pygambit.Decimal(payoff)
-        cur_node.outcome = payoff_tuple
+        # compute payoffs for all agents
+        payoffs = [float(macid.expected_utility(context=context, agent=agent)) for agent in agents_list]
+        # create outcome with payoffs and label
+        outcome = game.add_outcome(payoffs, label=str(node_idx))
+        game.set_outcome(cur_node, outcome)
 
     return game
 
