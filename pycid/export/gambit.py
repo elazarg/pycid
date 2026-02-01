@@ -109,6 +109,14 @@ def macid_to_efg(
                 chance_infoset = cur_node.infoset
                 # Set all chance probabilities at once
                 probs = [float(p) for p in factor.values]
+                # Handle unreachable branches where probs don't sum to 1
+                prob_sum = sum(probs)
+                if prob_sum < 1e-9:
+                    # Unreachable branch - use uniform distribution
+                    probs = [1.0 / len(actions)] * len(actions)
+                elif abs(prob_sum - 1.0) > 1e-9:
+                    # Normalize if not exactly 1
+                    probs = [p / prob_sum for p in probs]
                 game.set_chance_probs(chance_infoset, probs)
                 # add state info
                 for action_idx, action in enumerate(actions):
